@@ -12,7 +12,7 @@
  * right-click Jump List ("任务栏右键 → 退出").
  */
 
-const { app, BrowserWindow, dialog, Tray, Menu, nativeImage, Notification } = require('electron');
+const { app, BrowserWindow, dialog, Tray, Menu, nativeImage, Notification, ipcMain, shell } = require('electron');
 const { spawn, execFile, execFileSync } = require('node:child_process');
 const path = require('node:path');
 const os = require('node:os');
@@ -217,6 +217,44 @@ async function checkForUpdates() {
 }
 
 let hintShown = false;
+
+/** Pop a native toast and pull the window forward on click. */
+function notifyUser(title, body, { clickShowsWindow = true, flash = false } = {}) {
+  if (!Notification.isSupported()) return;
+  try {
+    const n = new Notification({ title, body: body || '' });
+    if (clickShowsWindow) n.on('click', () => showMainWindow());
+    n.show();
+  } catch { /* best-effort */ }
+  if (flash && mainWindow && !mainWindow.isDestroyed() && !mainWindow.isFocused()) {
+    mainWindow.flashFrame(true);
+    mainWindow.once('focus', () => mainWindow.flashFrame(false));
+  }
+}
+
+/** Handle attention events reported by the preload observer. */
+function handleAttention(event) {
+  const hidden = !mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible();
+  const focused = mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused();
+  if (event === 'question') {
+    // The UI is asking for a decision: always surface it, even on top of
+    // other work, because the agent is blocked until it is answered.
+    console.log('[dsh-attention] question pending');
+    notifyUser('DeepSeek Harness 需要你的确认', '代理正在等待你的选择，点击此处回到窗口作答。', { flash: true });
+    if (hidden) showMainWindow();
+  } else if (event === 'task-done') {
+    // Only notify when the user is not already looking at the app.
+    if (!focused) {
+      console.log('[dsh-attention] task finished');
+      notifyUser('任务已完成', 'DeepSeek Harness 已完成当前任务，点击查看结果。');
+    }
+  }
+}
+
+ipcMain.on('dsh-attention', (_event, kind) => {
+  try { handleAttention(kind); } catch { /* best-effort */ }
+});
+
 function showTrayHintOnce() {
   if (hintShown || !Notification.isSupported()) return;
   hintShown = true;
@@ -319,6 +357,7 @@ function boot() {
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: true,
+          preload: path.join(__dirname, 'preload.js'),
         },
       });
 
