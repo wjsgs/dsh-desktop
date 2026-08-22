@@ -146,7 +146,7 @@ function createTray() {
   tray.setToolTip('DeepSeek Harness');
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示主窗口', click: showMainWindow },
-    { label: '检查更新', click: () => { checkForUpdates().catch(() => {}); } },
+    { label: '检查更新', click: () => { openUpdateWindow(); } },
     { type: 'separator' },
     { label: '退出', click: quitApp },
   ]));
@@ -204,9 +204,110 @@ function isNewerVersion(latest, current) {
   return false;
 }
 
-/** Self-update: check npm for a newer dsh core, install it, relaunch. */
-async function checkForUpdates() {
-  const win = (mainWindow && !mainWindow.isDestroyed()) ? mainWindow : undefined;
+let updateWin = null;
+let updateBusy = false;
+let updateChild = null;
+
+function sendUpdateState(state) {
+  if (updateWin && !updateWin.isDestroyed()) {
+    try { updateWin.webContents.send('update-state', state); } catch { /* window closing */ }
+  }
+}
+
+/** The update window page: status, live npm output tail, elapsed time. */
+const UPDATE_PAGE = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><style>
+  html, body { margin: 0; height: 100%; background: #0f1115; color: #e6e6e6;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif; display: flex;
+    flex-direction: column; padding: 22px 24px; box-sizing: border-box; user-select: none; }
+  h1 { font-size: 17px; margin: 0 0 6px; }
+  .ver { font-size: 13px; color: #8a93a6; margin-bottom: 14px; min-height: 18px; }
+  .bar { height: 6px; border-radius: 3px; background: #232833; overflow: hidden; margin-bottom: 10px; }
+  .bar > i { display: block; height: 100%; width: 40%; border-radius: 3px;
+    background: linear-gradient(90deg, #2a6fdb, #4d9fff); }
+  .bar.indet > i { animation: slide 1.1s ease-in-out infinite; }
+  @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+  .bar.done > i { width: 100%; margin: 0; animation: none; background: #35b268; }
+  .bar.err > i { width: 100%; margin: 0; animation: none; background: #d05050; }
+  .status { font-size: 14px; margin-bottom: 12px; }
+  .log { flex: 1; overflow-y: auto; background: #171b23; border: 1px solid #232833;
+    border-radius: 8px; padding: 10px 12px; font: 12px/1.55 Consolas, monospace;
+    color: #9fb0c8; white-space: pre-wrap; word-break: break-all; }
+  .row { display: flex; gap: 10px; margin-top: 14px; }
+  button { flex: 1; padding: 9px 0; border: 0; border-radius: 8px; cursor: pointer;
+    font-size: 13px; font-family: inherit; background: #2a6fdb; color: #fff; }
+  button.ghost { background: #232833; color: #9fb0c8; }
+  button:disabled { opacity: .45; cursor: default; }
+</style></head>
+<body>
+  <h1>软件更新</h1>
+  <div class="ver" id="ver"></div>
+  <div class="bar indet" id="bar"><i></i></div>
+  <div class="status" id="status">正在检查新版本…</div>
+  <div class="log" id="log"></div>
+  <div class="row" id="btns" style="display:none">
+    <button class="ghost" id="close">关闭</button>
+    <button id="go">开始更新</button>
+  </div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let t0 = null;
+  setInterval(() => {
+    if (t0 !== null) $('status').textContent = $('status').dataset.base +
+      '（已用时 ' + Math.floor((Date.now() - t0) / 1000) + ' 秒）';
+  }, 1000);
+  window.updateApi.onState((s) => {
+    if (s.ver !== undefined) $('ver').textContent = s.ver;
+    if (s.log !== undefined) {
+      $('log').textContent = s.log || '（等待 npm 输出…）';
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+    if (s.phase) {
+      $('status').dataset.base = s.text;
+      $('status').textContent = s.text + (t0 !== null && s.phase === 'installing' ?
+        '（已用时 ' + Math.floor((Date.now() - t0) / 1000) + ' 秒）' : '');
+      $('bar').className = 'bar ' + (s.phase === 'done' ? 'done' :
+        s.phase === 'error' ? 'err' : 'indet');
+      if (s.phase === 'installing' && t0 === null) t0 = Date.now();
+      const show = s.phase === 'available' || s.phase === 'error';
+      $('btns').style.display = show ? 'flex' : 'none';
+      $('go').textContent = s.phase === 'error' ? '重试' : '开始更新';
+    }
+  });
+  $('go').onclick = () => { t0 = null; $('btns').style.display = 'none'; window.updateApi.action('start'); };
+  $('close').onclick = () => window.updateApi.action('close');
+</script>
+</body></html>`;
+
+/** Open the update window and kick off the version check. */
+function openUpdateWindow() {
+  if (updateWin && !updateWin.isDestroyed()) {
+    updateWin.show();
+    updateWin.focus();
+    return;
+  }
+  updateWin = new BrowserWindow({
+    width: 460,
+    height: 540,
+    title: '软件更新',
+    autoHideMenuBar: true,
+    backgroundColor: '#0f1115',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      preload: path.join(__dirname, 'update-preload.js'),
+    },
+  });
+  updateWin.removeMenu();
+  updateWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(UPDATE_PAGE));
+  updateWin.on('closed', () => { updateWin = null; });
+  updateWin.webContents.on('did-finish-load', runUpdateCheck);
+}
+
+async function runUpdateCheck() {
+  sendUpdateState({ phase: 'checking', text: '正在检查新版本…', log: '' });
   let latest, current;
   try {
     [latest, current] = await Promise.all([
@@ -214,36 +315,74 @@ async function checkForUpdates() {
       runHidden(['dsh', '--version'], 30_000),
     ]);
   } catch (err) {
-    dialog.showErrorBox('检查更新失败', String(err && err.message || err));
+    sendUpdateState({ phase: 'error', text: '检查更新失败', log: String(err && err.message || err) });
     return;
   }
   if (!isNewerVersion(latest, current)) {
-    dialog.showMessageBox(win, {
-      type: 'info',
-      title: '检查更新',
-      message: '已是最新版本',
-      detail: `dsh 核心：${current}`,
-    });
+    sendUpdateState({ phase: 'uptodate', text: '已是最新版本', ver: `dsh 核心：${current}` });
     return;
   }
-  const choice = await dialog.showMessageBox(win, {
-    type: 'question',
-    title: '发现新版本',
-    buttons: ['立即更新并重启', '稍后再说'],
-    defaultId: 0,
-    message: `dsh 核心有新版本：${current} → ${latest}`,
-    detail: '更新需要 1-2 分钟，完成后应用会自动重启。',
+  updateBusy = { latest, current };
+  sendUpdateState({
+    phase: 'available',
+    text: `发现新版本：${current} → ${latest}`,
+    ver: `dsh 核心：${current} → ${latest}`,
+    log: '点击「开始更新」自动安装，完成后应用会自动重启。',
   });
-  if (choice.response !== 0) return;
-  try {
-    await runHidden(['npm', 'install', '-g', `@deepseek-ai/dsh@${latest}`], 600_000);
-  } catch (err) {
-    dialog.showErrorBox('更新失败', String(err && err.message || err));
+}
+
+ipcMain.on('update-action', (_e, action) => {
+  if (action === 'close') {
+    if (updateWin && !updateWin.isDestroyed()) updateWin.close();
     return;
   }
-  app.relaunch();
-  quitApp();
+  if (action === 'start' && updateBusy && updateChild === null) startUpdateInstall();
+});
+
+/** Stream `npm install -g` output into the update window, then relaunch. */
+function startUpdateInstall() {
+  const { latest } = updateBusy;
+  sendUpdateState({ phase: 'installing', text: `正在安装 ${latest}…`, log: '' });
+  updateChild = spawn('cmd', ['/c', 'npm', 'install', '-g', `@deepseek-ai/dsh@${latest}`], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const lines = [];
+  let lastSend = 0;
+  const push = (chunk) => {
+    const text = chunk.toString()
+      .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+      .replace(/\r/g, '\n');
+    for (const l of text.split('\n')) {
+      const t = l.trim();
+      if (t) lines.push(t);
+      if (lines.length > 60) lines.shift();
+    }
+    const now = Date.now();
+    if (now - lastSend > 300) {
+      lastSend = now;
+      sendUpdateState({ phase: 'installing', log: lines.join('\n') });
+    }
+  };
+  updateChild.stdout.on('data', push);
+  updateChild.stderr.on('data', push);
+  updateChild.on('error', (err) => {
+    updateChild = null;
+    sendUpdateState({ phase: 'error', text: '更新失败', log: String(err && err.message || err) });
+  });
+  updateChild.on('exit', (code) => {
+    const child = updateChild;
+    updateChild = null;
+    if (code === 0) {
+      sendUpdateState({ phase: 'done', text: '更新完成，正在重启…', log: lines.join('\n') });
+      setTimeout(() => { app.relaunch(); quitApp(); }, 1200);
+    } else {
+      sendUpdateState({ phase: 'error', text: `更新失败（npm 退出码 ${code}）`, log: lines.join('\n') });
+    }
+    void child;
+  });
 }
+
 
 let hintShown = false;
 
