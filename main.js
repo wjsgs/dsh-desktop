@@ -164,13 +164,42 @@ function runHidden(args, timeoutMs = 90_000) {
   });
 }
 
-/** Compare two dotted version strings; true when latest is newer. */
+/** Parse a semver string into core numbers + prerelease tag. */
+function parseVer(v) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(v).trim());
+  if (!m) return null;
+  return { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] || '' };
+}
+
+/** Semver-aware comparison; true when latest is strictly newer than current. */
 function isNewerVersion(latest, current) {
-  const a = String(latest).split('.').map(Number);
-  const b = String(current).split('.').map(Number);
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    const d = (a[i] || 0) - (b[i] || 0);
-    if (d !== 0) return d > 0;
+  const a = parseVer(latest);
+  const b = parseVer(current);
+  if (!a || !b) return false;
+  for (const k of ['major', 'minor', 'patch']) {
+    if (a[k] !== b[k]) return a[k] > b[k];
+  }
+  if (a.pre === b.pre) return false;
+  if (!a.pre) return true;  // release beats any prerelease of the same core
+  if (!b.pre) return false;
+  // Both prerelease: compare dotted identifiers per semver rules.
+  const ai = a.pre.split('.');
+  const bi = b.pre.split('.');
+  for (let i = 0; i < Math.max(ai.length, bi.length); i++) {
+    const x = ai[i];
+    const y = bi[i];
+    if (x === undefined) return false;
+    if (y === undefined) return true;
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) {
+      const d = +x - +y;
+      if (d !== 0) return d > 0;
+    } else if (xn !== yn) {
+      return yn; // numeric identifiers sort below alphanumeric ones
+    } else if (x !== y) {
+      return x > y;
+    }
   }
   return false;
 }

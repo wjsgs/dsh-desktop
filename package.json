@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "DeepSeek Harness desktop app (Electron wrapper around the official dsh web UI)",
   "main": "main.js",
